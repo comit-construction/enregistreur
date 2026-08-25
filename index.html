@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Enregistrer ma demande</title>
+<style>
+  :root{
+    --bg:#f5f6f8; --carte:#ffffff; --texte:#1c2024; --gris:#6b7280;
+    --bord:#e3e6ea; --accent:#1f6feb; --rouge:#d92d20; --vert:#067647;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    background:var(--bg); color:var(--texte);
+    min-height:100vh; display:flex; align-items:center; justify-content:center;
+    padding:20px;
+  }
+  .carte{
+    background:var(--carte); width:100%; max-width:420px;
+    border:1px solid var(--bord); border-radius:12px;
+    padding:28px 24px; text-align:center;
+    box-shadow:0 1px 3px rgba(0,0,0,.06);
+  }
+  h1{font-size:18px; font-weight:600; margin-bottom:6px}
+  .sous{font-size:14px; color:var(--gris); line-height:1.5; margin-bottom:24px}
+  .minuteur{
+    font-size:40px; font-weight:600; font-variant-numeric:tabular-nums;
+    letter-spacing:.02em; margin:18px 0 4px;
+  }
+  .etat{font-size:14px; font-weight:500; margin-bottom:18px}
+  .etat.rec{color:var(--rouge)}
+  .etat.ok{color:var(--vert)}
+  .pastille{
+    display:inline-block; width:9px; height:9px; border-radius:50%;
+    background:var(--rouge); margin-right:7px; vertical-align:middle;
+    animation:pulse 1.2s ease-in-out infinite;
+  }
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+  button{
+    font:inherit; font-size:15px; font-weight:500; cursor:pointer;
+    border-radius:8px; padding:12px 18px; border:1px solid var(--bord);
+    background:#fff; color:var(--texte); width:100%; margin-top:8px;
+    transition:filter .12s ease;
+  }
+  button:hover:not(:disabled){filter:brightness(.97)}
+  button:disabled{opacity:.5; cursor:not-allowed}
+  button.principal{background:var(--accent); border-color:var(--accent); color:#fff}
+  button.danger{background:var(--rouge); border-color:var(--rouge); color:#fff}
+  .rangee{display:flex; gap:8px}
+  .rangee button{margin-top:0}
+  audio{width:100%; margin:14px 0 4px; height:38px}
+  .erreur{
+    background:#fef3f2; border:1px solid #fecdca; color:#912018;
+    font-size:13.5px; line-height:1.5; border-radius:8px;
+    padding:12px 14px; margin-top:16px; text-align:left; display:none;
+  }
+  .aide{font-size:12.5px; color:var(--gris); margin-top:16px; line-height:1.5}
+</style>
+</head>
+<body>
+<main class="carte">
+  <h1>🎙️ Enregistrer une description</h1>
+  <p class="sous">Décris ton projet ou ta demande vocalement.</p>
+
+  <div id="minuteur" class="minuteur" style="display:none">00:00</div>
+  <div id="etat" class="etat"></div>
+
+  <div id="zoneAudio"></div>
+  <div id="boutons"></div>
+
+  <div id="erreur" class="erreur"></div>
+  <p class="aide" id="aide">Durée maximale : 3 minutes.</p>
+</main>
+
+<script>
+(function () {
+  'use strict';
+
+  var MAX_SECONDES = 180;
+  var MAX_OCTETS = 8 * 1024 * 1024; // 8 Mo
+
+  // Origine du formulaire, transmise par la page qui ouvre ce popup.
+  var params = new URLSearchParams(location.search);
+  var origineParent = params.get('origin') || '';
+  var cibleMessage = (origineParent && origineParent !== 'null') ? origineParent : '*';
+
+  var flux = null;          // MediaStream
+  var enregistreur = null;  // MediaRecorder
+  var morceaux = [];
+  var blobAudio = null;
+  var urlObjet = null;
+  var intervalle = null;
+  var secondes = 0;
+  var envoiEnCours = false;
+  var dejaEnvoye = false;
+
+  var elMinuteur = document.getElementById('minuteur');
+  var elEtat = document.getElementById('etat');
+  var elZone = document.getElementById('zoneAudio');
+  var elBoutons = document.getElementById('boutons');
+  var elErreur = document.getElementById('erreur');
+  var elAide = document.getElementById('aide');
+
+  function mmss(n) {
+    var m = Math.floor(n / 60), s = n % 60;
+    return (m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s;
+  }
+
+  function erreur(msg) {
+    elErreur.textContent = msg;
+    elErreur.style.display = 'block';
+  }
+  function effacerErreur() {
+    elErreur.style.display = 'none';
+    elErreur.textContent = '';
+  }
+
+  function libererMedia() {
+    if (intervalle) { clearInterval(intervalle); intervalle = null; }
+    if (flux) {
+      flux.getTracks().forEach(function (t) { try { t.stop(); } catch (e) {} });
+      flux = null;
+    }
+    enregistreur = null;
+  }
+
+  function libererAudio() {
+    if (urlObjet) { URL.revokeObjectURL(urlObjet); urlObjet = null; }
+    blobAudio = null;
+    morceaux = [];
+  }
+
+  // ---------- Choix du format supporté par le navigateur ----------
+  function choisirFormat() {
+    var candidats = [
+      'audio/webm;codecs=opus',
+      'audio/webm',
+      'audio/mp4;codecs=mp4a.40.2',
+      'audio/mp4',
+      'audio/ogg;codecs=opus'
+    ];
+    if (typeof MediaRecorder === 'undefined' || !MediaRecorder.isTypeSupported) return '';
+    for (var i = 0; i < candidats.length; i++) {
+      if (MediaRecorder.isTypeSupported(candidats[i])) return candidats[i];
+    }
+    return '';
+  }
+
+  // ---------- Écrans ----------
+  function ecranDepart() {
+    libererAudio();
+    elMinuteur.style.display = 'none';
+    elMinuteur.textContent = '00:00';
+    elEtat.className = 'etat';
+    elEtat.textContent = '';
+    elZone.innerHTML = '';
+    elAide.textContent = 'Durée maximale : 3 minutes.';
+    elBoutons.innerHTML = '';
+    var b = document.createElement('button');
+    b.className = 'principal';
+    b.textContent = 'Commencer l’enregistrement';
+    b.onclick = demarrer;
+    elBoutons.appendChild(b);
+  }
+
+  function ecranEnregistrement() {
+    elMinuteur.style.display = 'block';
+    elEtat.className = 'etat rec';
+    elEtat.innerHTML = '<span class="pastille"></span>Enregistrement en cours';
+    elZone.innerHTML = '';
+    elAide.textContent = 'Parle normalement. L’enregistrement s’arrête seul à 3 minutes.';
+    elBoutons.innerHTML = '';
+    var b = document.createElement('button');
+    b.className = 'danger';
+    b.textContent = 'Arrêter';
+    b.onclick = arreter;
+    elBoutons.appendChild(b);
+  }
+
+  function ecranPreecoute() {
+    elEtat.className = 'etat ok';
+    elEtat.textContent = 'Enregistrement terminé • ' + mmss(secondes);
+
+    elZone.innerHTML = '';
+    var audio = document.createElement('audio');
+    audio.controls = true;
+    audio.preload = 'metadata';
+    audio.src = urlObjet;
+    elZone.appendChild(audio);
+
+    elAide.textContent = 'Écoute-toi avant d’envoyer. Tu peux recommencer autant de fois que tu veux.';
+
+    elBoutons.innerHTML = '';
+    var rangee = document.createElement('div');
+    rangee.className = 'rangee';
+
+    var bRefaire = document.createElement('button');
+    bRefaire.textContent = 'Recommencer';
+    bRefaire.onclick = function () { effacerErreur(); ecranDepart(); };
+
+    var bEnvoyer = document.createElement('button');
+    bEnvoyer.className = 'principal';
+    bEnvoyer.textContent = 'Envoyer';
+    bEnvoyer.onclick = function () { envoyer(bEnvoyer, bRefaire); };
+
+    rangee.appendChild(bRefaire);
+    rangee.appendChild(bEnvoyer);
+    elBoutons.appendChild(rangee);
+  }
+
+  // ---------- Enregistrement ----------
+  function demarrer() {
+    effacerErreur();
+
+    if (!window.isSecureContext) {
+      erreur('Cette page doit être ouverte en HTTPS pour accéder au microphone.');
+      return;
+    }
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || typeof MediaRecorder === 'undefined') {
+      erreur('Ton navigateur ne permet pas l’enregistrement audio. Essaie Chrome, Safari ou Firefox à jour.');
+      return;
+    }
+
+    navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    }).then(function (s) {
+      flux = s;
+      var format = choisirFormat();
+      var options = { audioBitsPerSecond: 32000 };
+      if (format) options.mimeType = format;
+
+      try {
+        enregistreur = new MediaRecorder(flux, options);
+      } catch (e) {
+        try { enregistreur = new MediaRecorder(flux); }
+        catch (e2) {
+          libererMedia();
+          erreur('Ton navigateur refuse de démarrer l’enregistrement (format non supporté).');
+          return;
+        }
+      }
+
+      morceaux = [];
+      enregistreur.ondataavailable = function (ev) {
+        if (ev.data && ev.data.size > 0) morceaux.push(ev.data);
+      };
+      enregistreur.onerror = function () {
+        libererMedia();
+        erreur('Une erreur est survenue pendant l’enregistrement. Réessaie.');
+        ecranDepart();
+      };
+      enregistreur.onstop = function () {
+        var type = (enregistreur && enregistreur.mimeType) || (morceaux[0] && morceaux[0].type) || 'audio/webm';
+        blobAudio = new Blob(morceaux, { type: type });
+        morceaux = [];
+        libererMedia();
+
+        if (!blobAudio.size) {
+          erreur('Aucun son n’a été capté. Vérifie que le bon micro est sélectionné.');
+          ecranDepart();
+          return;
+        }
+        if (urlObjet) URL.revokeObjectURL(urlObjet);
+        urlObjet = URL.createObjectURL(blobAudio);
+        ecranPreecoute();
+      };
+
+      secondes = 0;
+      elMinuteur.textContent = '00:00';
+      enregistreur.start();
+      ecranEnregistrement();
+
+      intervalle = setInterval(function () {
+        secondes++;
+        elMinuteur.textContent = mmss(secondes);
+        if (secondes >= MAX_SECONDES) arreter();
+      }, 1000);
+
+    }).catch(function (err) {
+      var nom = err && err.name ? err.name : '';
+      if (nom === 'NotAllowedError' || nom === 'SecurityError') {
+        erreur('Accès au microphone refusé. Clique sur l’icône de cadenas dans la barre d’adresse, autorise le micro, puis recharge la page.');
+      } else if (nom === 'NotFoundError' || nom === 'DevicesNotFoundError') {
+        erreur('Aucun microphone détecté sur cet appareil.');
+      } else if (nom === 'NotReadableError') {
+        erreur('Le microphone est déjà utilisé par une autre application. Ferme-la et réessaie.');
+      } else {
+        erreur('Impossible d’accéder au microphone. ' + (err && err.message ? err.message : ''));
+      }
+    });
+  }
+
+  function arreter() {
+    if (intervalle) { clearInterval(intervalle); intervalle = null; }
+    if (enregistreur && enregistreur.state !== 'inactive') {
+      try { enregistreur.stop(); } catch (e) { libererMedia(); ecranDepart(); }
+    }
+  }
+
+  // ---------- Envoi vers le formulaire ----------
+  function envoyer(bEnvoyer, bRefaire) {
+    if (envoiEnCours || dejaEnvoye) return;
+    effacerErreur();
+
+    if (!blobAudio) { erreur('Aucun enregistrement à envoyer.'); return; }
+    if (blobAudio.size > MAX_OCTETS) {
+      erreur('Enregistrement trop volumineux. Refais-en un plus court.');
+      return;
+    }
+    if (!window.opener || window.opener.closed) {
+      erreur('La fenêtre du formulaire a été fermée. Rouvre l’enregistreur depuis le formulaire.');
+      return;
+    }
+
+    envoiEnCours = true;
+    bEnvoyer.disabled = true;
+    bRefaire.disabled = true;
+    bEnvoyer.textContent = 'Envoi…';
+
+    var lecteur = new FileReader();
+    lecteur.onerror = function () {
+      envoiEnCours = false;
+      bEnvoyer.disabled = false;
+      bRefaire.disabled = false;
+      bEnvoyer.textContent = 'Envoyer';
+      erreur('Lecture du fichier impossible. Réessaie.');
+    };
+    lecteur.onload = function () {
+      var resultat = String(lecteur.result || '');
+      var virgule = resultat.indexOf(',');
+      var base64 = virgule >= 0 ? resultat.slice(virgule + 1) : '';
+      if (!base64) {
+        envoiEnCours = false;
+        bEnvoyer.disabled = false;
+        bRefaire.disabled = false;
+        bEnvoyer.textContent = 'Envoyer';
+        erreur('Le fichier audio semble vide. Refais un enregistrement.');
+        return;
+      }
+
+      try {
+        window.opener.postMessage({
+          source: 'ENREGISTREUR_SOUMISSION',
+          base64: base64,
+          mimeType: (blobAudio.type || 'audio/webm').split(';')[0],
+          duree: secondes
+        }, cibleMessage);
+      } catch (e) {
+        envoiEnCours = false;
+        bEnvoyer.disabled = false;
+        bRefaire.disabled = false;
+        bEnvoyer.textContent = 'Envoyer';
+        erreur('Envoi vers le formulaire impossible. Rouvre l’enregistreur depuis le formulaire.');
+        return;
+      }
+
+      dejaEnvoye = true;
+      elEtat.className = 'etat ok';
+      elEtat.textContent = '✅ Envoyé au formulaire';
+      elBoutons.innerHTML = '';
+      elAide.textContent = 'Cette fenêtre se ferme automatiquement…';
+      libererAudio();
+      setTimeout(function () { window.close(); }, 900);
+    };
+    lecteur.readAsDataURL(blobAudio);
+  }
+
+  // ---------- Nettoyage ----------
+  window.addEventListener('pagehide', function () { libererMedia(); libererAudio(); });
+  window.addEventListener('beforeunload', function () { libererMedia(); libererAudio(); });
+
+  // ---------- Démarrage ----------
+  if (!window.opener) {
+    elAide.textContent = 'Mode test : ouvre normalement cette page depuis le formulaire. Ici, le bouton Envoyer restera sans effet.';
+  }
+  ecranDepart();
+})();
+</script>
+</body>
+</html>
